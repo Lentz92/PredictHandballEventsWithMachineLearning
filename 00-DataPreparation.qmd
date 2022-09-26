@@ -1,7 +1,7 @@
 ---
 title: "00-DataPreparation"
 author: "Nicki Lentz"
-date: "27/10/2021"
+date: "`r Sys.Date()`"
 output: html_document
 editor_options: 
   chunk_output_type: console
