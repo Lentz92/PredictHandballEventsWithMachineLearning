@@ -1,7 +1,8 @@
 ---
 title: "02-FinalXgBoostModel"
-format: html
+author: "Nicki lentz"
 date: "`r Sys.Date()`"
+output: html_document
 editor_options: 
   chunk_output_type: console
 ---
