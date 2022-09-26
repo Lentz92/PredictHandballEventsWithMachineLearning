@@ -1,7 +1,7 @@
 ---
 title: "02-FinalXgBoostModel"
 format: html
-editor: visual
+date: "`r Sys.Date()`"
 editor_options: 
   chunk_output_type: console
 ---
