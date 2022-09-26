@@ -1,0 +1,427 @@
+---
+title: "00-DataPreparation"
+author: "Nicki Lentz"
+date: "27/10/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.height = 10,
+  fig.width = 25,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(sqldf)
+source("scripts/import_all.R")
+```
+
+## 01-Clean
+
+All the IMU data was separated into 12 different csv files mapped for 12 different participants.
+Same goes for the labeling data which was in another 12 csv files. 
+These needed to be loaded and joined correctly for each participant. Afterwards, the data
+was cleaned with a signal filter and unnested to become one large dataframe.
+
+```{r}
+IMUpath <- "data/raw/IMUCorrectMapped/"
+labelPath <- "data/raw/TAGS/AllNewTags/"
+
+data <- import_all(IMUpath, labelPath)
+
+
+dfList <- list()
+for (i in 1:length(data$IMU)){
+  # use sqldf to join two dataframes by time
+  # specify the columns you want in your final dataframe
+  # specify you want to first 'pull' from IMU2
+  # Left join (join labels TO IMU2) by comparing timestamp to...
+  # between time1 and time2
+  
+  subjectIMU <- data$IMU[[i]]
+  subjectTAGS <- data$TAGS[[i]] 
+  
+  
+  IMU_labeled <- sqldf('SELECT timestamp, Subject, forward, up, side, rawForward, rawSide, rawUp, 
+                       roll, pitch,yaw, IMUforward, IMUside, Tag, Occurence
+      FROM subjectIMU
+      LEFT JOIN subjectTAGS ON Timestamp BETWEEN OffsetIn and OffsetOut') 
+  
+  IMU_labeled <- IMU_labeled %>% 
+    filter(Timestamp <= max(subjectTAGS$OffsetIn))
+  
+  
+  #Apply Signal Filter
+  #12Hz cutoff filter for the acceleration data and 19hz for the rotation (Wundersits 2015, Miller 2022)
+  fs = 100
+  wAcc = 12 / (fs/2)
+  wRot = 19 / (fs/2)
+  bfAcc <- signal::butter(n = 2, W = wAcc, type = "low")
+  bfRot <- signal::butter(n = 2, W = wRot, type = "low")
+  
+  # OccID works as an identifier for each 50 samples for each occurence of a specific tag.
+  # To secure correct identification a new column was made "TagOcc". If a solution
+  # was implemented that grouped by Tag a situation where an occurence ended with a block with
+  # only 60 samples, and then when it saw the tag again it would see those as the next 40 samples
+  # even though that occurence had nothing to do with the prior.
+  IMU_labeled <- IMU_labeled %>% 
+    mutate(across(c(forward, up, side, rawForward, 
+                    rawSide, rawUp, IMUforward, IMUside), ~ signal::filtfilt(bfAcc, .x)),
+           across(c(roll, pitch, yaw), ~ signal::filtfilt(bfRot, .x)),
+           index = row_number(),
+           TagOcc = paste(Tag, Occurence, sep = "_")) %>% 
+    group_by(TagOcc) %>% 
+    # Only recalculate the occurences for tags that is not throw. Because Throw,
+    # is not always precisely 1s of duration but close.
+    mutate(OccGrouped = ifelse(Tag == "Throw", 
+                               as.numeric(Occurence), ceiling(1:n()/50)),
+           #Create unique ID for each occurence
+           OccID = paste(TagOcc, OccGrouped, sep = "_")) %>% 
+    ungroup()
+  
+  
+  
+  
+  dfList[[i]] <- IMU_labeled
+}
+
+dfRaw <- dfList %>% 
+  bind_rows(dfList) %>% 
+  group_by(Subject) %>% 
+  distinct() %>%
+  arrange(Timestamp) %>% 
+  ungroup() %>% 
+  relocate(Tag, Occurence, OccID, .after=Subject)
+
+data.table::fwrite(dfRaw, file = "data/dfRawAllTags.csv", row.names = FALSE)
+save(dfList, file = "data/dfListAllTags.Rdata")
+```
+
+
+## 02-Featureengineering vectors
+
+Purpose was to create new feature vectors which later would be aggregated into windows.
+
+```{r}
+energySignal <- function(vector){
+  
+  var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
+  var.spy <- 2*var.spec$spec
+  
+  energy <- sum(sqrt(var.spy^2)) / length(var.spy)
+  return(energy)
+}
+
+peakEnergySignal <- function(vector){
+  var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
+  var.spy <- 2*var.spec$spec
+  
+  normalizedPeak <- max(var.spy / length(vector))
+  return(normalizedPeak)
+}
+```
+
+```{r}
+#Feature Engineering
+for (i in 1:length(dfList)){
+  
+  print(paste0("Feature Vector for subject ", i))
+  
+  dfList[[i]] <- dfList[[i]] %>%
+    mutate(
+      #Detrend was used to secure no linear trends would pollute the data. 
+      forward = pracma::detrend(forward),
+      up = pracma::detrend(up),
+      side = pracma::detrend(side),
+      roll = pracma::detrend(roll),
+      pitch = pracma::detrend(pitch),
+      yaw = pracma::detrend(yaw),
+      #Integral to calculate the linear velocity
+      forwardVel = as.vector(pracma::cumtrapz(Timestamp, forward*9.82)),
+      upVel = as.vector(pracma::cumtrapz(Timestamp, up*9.82)),
+      sideVel = as.vector(pracma::cumtrapz(Timestamp, side*9.82)),
+      #Magnitudes of the linear acceleration and angular velocity
+      magnitude = sqrt(forward^2 + up^2 + side^2),
+      rotMagnitude = sqrt(roll^2 + pitch^2 + yaw^2),
+      index = row_number()) %>%
+    #Making classes to factors
+    mutate_if(is.character, as.factor) %>% 
+    #Removing unused vectors
+    select(c(-rawForward, -rawUp, -rawSide))
+  
+  #Calculating the total integral for each sub occurence (0.5s blocks)
+  dfList[[i]] <- dfList[[i]] %>% 
+    group_by(OccID) %>% 
+    mutate(idx = row_number(),
+           intForward = sum(sqrt(forward^2)) / max(idx),
+           intUp = sum(sqrt(up^2)) / max(idx),
+           intSide = sum(sqrt(side^2)) / max(idx),
+           intRoll = sum(sqrt(roll^2)) / max(idx),
+           intPitch = sum(sqrt(pitch^2)) / max(idx),
+           intYaw = sum(sqrt(yaw^2)) / max(idx),
+           intMagnitude = sum(sqrt(magnitude^2)) / max(idx),
+           introtMagnitude = sum(sqrt(rotMagnitude^2)) / max(idx),
+           zerocrossForward = tsfeatures::firstzero_ac(forward),
+           zerocrossSide = tsfeatures::firstzero_ac(side),
+           zerocrossUp = tsfeatures::firstzero_ac(up),
+           zerocrossRoll = tsfeatures::firstzero_ac(roll),
+           zerocrossPitch = tsfeatures::firstzero_ac(pitch),
+           zerocrossYaw = tsfeatures::firstzero_ac(yaw),
+           zerocrossMagnitude = tsfeatures::firstzero_ac(magnitude),
+           zerocrossrotMagnitude = tsfeatures::firstzero_ac(rotMagnitude)) %>% 
+    #removing all sub occurences less than 25 data points
+    filter(max(idx) >= 25) %>% 
+    ungroup()
+  
+  #Calculating the energy signal (integral of each sub occurence in the frequency domain)
+  energyValues <- dfList[[i]] %>% 
+    group_by(OccID) %>% 
+    filter(max(idx) >= 25) %>% 
+    mutate_at(c("forward", "up", "side", "roll", 
+                "pitch", "yaw", "magnitude", "rotMagnitude"), energySignal) %>% 
+    ungroup() %>% 
+    select(forward, up, side, roll, pitch, yaw, magnitude, rotMagnitude)
+  
+  dfList[[i]]$energyForward <- energyValues$forward
+  dfList[[i]]$energyUp <- energyValues$up
+  dfList[[i]]$energySide <- energyValues$side
+  dfList[[i]]$energyRoll <- energyValues$roll
+  dfList[[i]]$energyPitch <- energyValues$pitch
+  dfList[[i]]$energyYaw <- energyValues$yaw
+  dfList[[i]]$energyMagnitude <- energyValues$magnitude
+  dfList[[i]]$energyrotMagnitude <- energyValues$rotMagnitude
+  
+  #Calculating the normalized peak energy signal
+  PeakenergyValues <- dfList[[i]] %>% 
+    group_by(OccID) %>% 
+    filter(max(idx) >= 25) %>% 
+    mutate_at(c("forward", "up", "side", "roll", 
+                "pitch", "yaw", "magnitude", "rotMagnitude"), peakEnergySignal) %>% 
+    ungroup() %>% 
+    select(forward, up, side, roll, pitch, yaw, magnitude, rotMagnitude)
+  
+  dfList[[i]]$energyPeakForward <- PeakenergyValues$forward
+  dfList[[i]]$energyPeakUp <- PeakenergyValues$up
+  dfList[[i]]$energyPeakSide <- PeakenergyValues$side
+  dfList[[i]]$energyPeakRoll <- PeakenergyValues$roll
+  dfList[[i]]$energyPeakPitch <- PeakenergyValues$pitch
+  dfList[[i]]$energyPeakYaw <- PeakenergyValues$yaw
+  dfList[[i]]$energyPeakMagnitude <- PeakenergyValues$magnitude
+  dfList[[i]]$energyPeakrotMagnitude <- PeakenergyValues$rotMagnitude
+  
+ 
+  
+  
+  
+  #Calculate following ACF:
+  #acf1 = First autocorrelation coefficient
+  #acf10 = Sum of squares of the first ten autocorrelation coefficients
+  #diff1_acf1 = Autocorrelation for the differenced data
+  #diff1_acf2 = Sum of squares of the first 10 autocorrelation coefficients for the differenced data
+  #diff2_acf1 and 10 = same as diff1 but twice differenced
+  #These are only done on magnitude and rotMagnitude, since they inherent all the information
+  #from the acceleration and rotation vectors, and with a limited data size I need to be carefull
+  #with the number of features.
+  acfMag <- dfList[[i]] %>% 
+    as_tsibble(index = Timestamp, key = OccID) %>% 
+    features(magnitude, feat_acf)
+  
+  acfMag <- dfList[[i]] %>% 
+    as_tsibble(index = Timestamp, key = OccID) %>% 
+    features(rotMagnitude, feat_acf)
+  
+  dfList[[i]] <- left_join(dfList[[i]], acfMag, by = "OccID") %>% 
+    as_tibble() %>% 
+    rename_at(vars(contains("acf")), ~ str_c(., "mag"))
+  
+  dfList[[i]] <- left_join(dfList[[i]], acfMag, by = "OccID") %>% 
+    as_tibble() %>% 
+    rename_at(vars(!ends_with("mag") & contains("acf")), ~ str_c(., "rot"))
+  
+  
+}
+
+df <- dfList %>% 
+  bind_rows(dfList) %>% 
+  group_by(Subject) %>% 
+  arrange(Timestamp) %>% 
+  distinct() %>% 
+  ungroup()
+
+data.table::fwrite(df, file = "data/dfFeaturesAllTags.csv", row.names = FALSE)
+save(dfList, file = "data/dfListFeaturesAllTags.Rdata")
+```
+
+
+## 03 - Featureengineering Mapping
+
+Aggregatting across the windows to calculate means, IQR, max, etc.
+
+```{r}
+load("data/processed/dfListFeaturesAllTags.Rdata")
+
+
+dfListMappings = list()
+for (i in 1:length(dfList)){
+  
+  print(paste("Feature Engineering started for subjects No. ", i, sep=""))
+  
+  #Summarize function ends up changing the order of timeseries data. So, I ended up using 
+  #transmute to avoid this.
+  dfListMappings[[i]] <- dfList[[i]] %>% 
+    group_by(OccID) %>% 
+    transmute(
+      Subject = Subject,
+      index = index,
+      Tag = Tag,
+      Occurence = Occurence,
+      acf1mag = acf1mag,
+      acf10mag = acf10mag,
+      diff1_acf1mag = diff1_acf1mag,
+      diff1_acf10mag = diff1_acf10mag,
+      diff2_acf1mag = diff2_acf1mag,
+      diff2_acf10mag = diff2_acf10mag,
+      acf1rot = acf1rot,
+      acf10rot = acf10rot,
+      diff1_acf1rot = diff1_acf1rot,
+      diff1_acf10rot = diff1_acf10rot,
+      diff2_acf1rot = diff2_acf1rot,
+      diff2_acf10rot = diff2_acf10rot,
+      energyForward = energyForward,
+      energyUp = energyUp,
+      energySide = energySide,
+      energyRoll = energyRoll,
+      energyPitch = energyPitch,
+      energyYaw = energyYaw,
+      energyMagnitude = energyMagnitude,
+      energyrotMagnitude = energyrotMagnitude,
+      energyPeakForward = energyPeakForward,
+      energyPeakUp = energyPeakUp,
+      energyPeakSide = energyPeakSide,
+      energyPeakRoll = energyPeakRoll,
+      energyPeakPitch = energyPeakPitch,
+      energyPeakYaw = energyPeakYaw,
+      energyPeakMagnitude = energyPeakMagnitude,
+      energyrotPeakMagnitude = energyPeakrotMagnitude,
+      zerocrossForwad = zerocrossForward,
+      zerocrossUp = zerocrossUp,
+      zerocrossSide = zerocrossSide,
+      zerocrossRoll = zerocrossRoll,
+      zerocrossPitch = zerocrossPitch,
+      zerocrossYaw = zerocrossYaw,
+      zerocrossMagnitude = zerocrossMagnitude,
+      zerocrossrotMagnitude = zerocrossrotMagnitude,
+      intForward = intForward,
+      intUp = intUp,
+      intSide = intSide,
+      intRoll = intRoll,
+      intPitch = intPitch,
+      intYaw = intYaw,
+      intMagnitude = intMagnitude,
+      introtMagnitude = introtMagnitude,
+      Timelength = max(row_number()),
+      forward_mean = mean(forward),
+      side_mean = mean(side),
+      up_mean = mean(up),
+      roll_mean = mean(roll),
+      pitch_mean = mean(pitch),
+      yaw_mean = mean(yaw),
+      magnitude_mean = mean(magnitude),
+      rotMagnitude_mean = mean(rotMagnitude),
+      forward_median = median(forward),
+      side_median = median(side),
+      up_median = median(up),
+      roll_median = median(roll),
+      pitch_median = median(pitch),
+      yaw_median = median(yaw),
+      magnitude_median = median(magnitude),
+      rotMagnitude_median = median(rotMagnitude),
+      forward_max = max(forward),
+      side_max = max(side),
+      up_max = max(up),
+      roll_max = max(roll),
+      pitch_max = max(pitch),
+      yaw_max = max(yaw),
+      magnitude_max = max(magnitude),
+      rotMagnitude_max = max(rotMagnitude),
+      forward_min = min(forward),
+      side_min = min(side),
+      up_min = min(up),
+      roll_min = min(roll),
+      pitch_min = min(pitch),
+      yaw_min = min(yaw),
+      magnitude_min = min(magnitude),
+      rotMagnitude_min = min(rotMagnitude),
+      forward_range = forward_max - forward_min,
+      side_range = side_max - side_min,
+      up_range = up_max - up_min,
+      roll_range = roll_max - roll_min,
+      pitch_range = pitch_max - pitch_min,
+      yaw_range = yaw_max - yaw_min,
+      magnitude_min = min(magnitude),
+      rotMagnitude_min = min(rotMagnitude),
+      forward_Q10 = quantile(forward, probs = .10),
+      side_Q10 = quantile(side, probs = .10),
+      up_Q10 = quantile(up, probs = .10),
+      roll_Q10 = quantile(roll, probs = .10),
+      pitch_Q10 = quantile(pitch, probs = .10),
+      yaw_Q10 = quantile(yaw, probs = .10),
+      magnitude_Q10 = quantile(magnitude, probs = .10),
+      rotMagnitude_Q10 = quantile(rotMagnitude, probs = .10),
+      forward_Q90 = quantile(forward, probs = .90),
+      side_Q90 = quantile(side, probs = .90),
+      up_Q90 = quantile(up, probs = .90),
+      roll_Q90 = quantile(roll, probs = .90),
+      pitch_Q90 = quantile(pitch, probs = .90),
+      yaw_Q90 = quantile(yaw, probs = .90),
+      magnitude_Q90 = quantile(magnitude, probs = .90),
+      rotMagnitude_Q90 = quantile(rotMagnitude, probs = .90),
+      forward_IQR = IQR(forward),
+      side_IQR = IQR(side),
+      up_IQR = IQR(up),
+      roll_IQR = IQR(roll),
+      pitch_IQR = IQR(pitch),
+      yaw_IQR = IQR(yaw),
+      magnitude_IQR = IQR(magnitude),
+      rotMagnitude_IQR = IQR(rotMagnitude)
+    ) %>% 
+    ungroup() %>% 
+    arrange(index)
+  
+  dfListMappings[[i]] <- dfListMappings[[i]][!duplicated(dfListMappings[[i]]$forward_mean),]
+  
+  
+}
+
+#Test to check if any colums contains NA values
+count = 0
+for (i in 1:length(dfListMappings)){
+  if(all(colSums(is.na(dfListMappings[[i]])) == 0)) {
+    next
+  } else if (all(colSums(is.na(dfListMappings[[i]])) != 0)){
+    count = count + 1
+  }
+}
+
+#if there is no NA values, then extract the data from the list to one big df,
+#and save as df and as nested list .Rdata
+if (count == 0){
+  dfMappings <- dfListMappings %>% 
+    bind_rows(dfListMappings) %>% 
+    group_by(Subject) %>% 
+    arrange(index) %>% 
+    distinct() %>% 
+    ungroup()
+  
+  data.table::fwrite(dfMappings, file = "data/dfMappingsAllTags.csv", row.names = FALSE)
+  save(dfListMappings, file = "data/dfListMappingsAllTags.Rdata")
+} else {
+  fprint("NA values found in dfListMappings")
+}
+
+```

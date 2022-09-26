@@ -1,0 +1,308 @@
+---
+title: "02-FinalXgBoostModel"
+format: html
+editor: visual
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.height = 10,
+  fig.width = 25,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyverse)
+library(tidymodels)
+tidymodels_prefer()
+library(doSNOW)
+library(finetune)
+source("PrettyConfusionMatrix.R")
+#ggthemr::ggthemr("greyscale")
+
+loadRData <- function(fileName){
+  #loads an RData file, and returns it
+  load(fileName)
+  get(ls()[ls() != "fileName"])
+}
+
+#Import results from the most important variables and the main df
+
+selectedFeatures <- loadRData(file = "../../data/processed/VSURF/combination_selectedfeatures_binary.Rdata")
+selectedFeatures <- 
+  #Convert the nested list of vectors to one long vector in a tibble
+  tibble(features = unlist(selectedFeatures)) %>% 
+  #count number of occurences of each feature
+  count(features) %>% 
+  #select only the features that was present for more than 6 athletes
+  filter(n >= 6)
+
+
+dfMappings <- data.table::fread("../../data/processed/dfMappingsAllTags.csv") %>% 
+  filter(Tag != "RESET")
+
+df <- dfMappings %>% 
+  mutate(
+    Tag = factor(Tag, levels = c("Low Intensity","Dynamic","Running","Throw")),
+    Subject = factor(Subject)
+    )
+```
+
+## MODEL
+
+```{r}
+j = 1
+xgbFitted <- list()
+xgbTrainResults <- list()
+xgbTestResults <- list()
+#Modelling over the training set 12 times, with a new subject pulled out as a test set each time
+#ending up with 12 trained models.
+for (i in unique(df$Subject)){
+
+  start_time = Sys.time()
+  print(glue::glue("Model {j} out of {length(unique(df$Subject))}"))
+  
+  #Data split based on leave-one-subject-out approach
+  dfTest <- df %>%
+    filter(Subject == i) %>% 
+    select(Subject, Tag, all_of(selectedFeatures$features))
+  
+  dfTrain <- df %>%
+    filter(Subject != i) %>% 
+    select(Subject, Tag, all_of(selectedFeatures$features))
+  
+  df_folds <- vfold_cv(dfTrain, v = 10, strata = Tag)
+  
+  #Create recipe
+  rec <-
+    recipe(formula = Tag ~ ., data = dfTrain) %>% 
+    step_rm(Subject)
+  
+  # -- Xgboost -- #
+  xgb_spec <- 
+    boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+               min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+    set_engine("xgboost") %>% 
+    set_mode("classification")
+  
+  #Create workflow
+  xgb_workflow <- workflow(rec, xgb_spec)
+  
+  #Multi-thread processing  
+  cl <- parallel::makePSOCKcluster(6)
+  doParallel::registerDoParallel(cl)
+
+  #Hyperparameter tuning  
+  set.seed(345)
+  xgb_rs <- tune_race_anova(
+    xgb_workflow,
+    resamples = df_folds,
+    grid = 25, 
+    #f_meas is the metric that defines which model is the best, however roc_auc has also been added
+    #to make the tuning return the posterior probability for each class decision.
+    metrics = metric_set(f_meas, roc_auc),
+    control = control_race(save_pred = TRUE,
+                           parallel_over = "everything",
+                           save_workflow = TRUE)
+  )
+  
+  stopCluster(cl)
+  registerDoSEQ()
+
+  
+  #Select best and finalize the workflow
+  best_xgb <- xgb_rs %>% 
+    select_best("f_meas")
+  
+  final_xgb_workflow <- 
+    xgb_workflow %>% 
+    finalize_workflow(best_xgb)
+  
+  fit_xgb <- 
+    fit(final_xgb_workflow, dfTrain)
+  
+  #Save the tuned model
+  xgbFitted[[j]] <- fit_xgb
+  
+  #Predict on the training data, to learn if the model overfits
+  prediction <- predict(fit_xgb, dfTrain)
+  prob_prediction <- predict(fit_xgb, dfTrain, type = "prob")
+  
+  #combining everything into one need dataframe.
+  Trainvalidated <- data.frame(
+    class = dfTrain$Tag,
+    .pred_class = prediction$.pred_class
+  ) %>% 
+    cbind(prob_prediction)
+  
+  xgbTrainResults[[j]] <- Trainvalidated
+  
+  #Predict on test set
+  prediction <- predict(fit_xgb, dfTest)
+  prob_prediction <- predict(fit_xgb, dfTest, type = "prob")
+  
+  #combining everything into one need dataframe.
+  Testvalidated <- data.frame(
+    class = dfTest$Tag,
+    .pred_class = prediction$.pred_class
+  ) %>% 
+    cbind(prob_prediction)
+  
+  xgbTestResults[[j]] <- Testvalidated
+  
+  j = j + 1
+  
+  end_time = Sys.time()
+  print(end_time - start_time)
+  
+}
+
+save(xgbFitted, file = "data/xgbFitted_multiclass.R")
+save(xgbTrainResults, file = "data/xgbTrainResults_multiclass.R")
+save(xgbTestResults, file = "data/xgbTestResults_multiclass.R")
+
+
+```
+
+# Look into the training results
+
+```{r}
+xgbTrainResultsMulticlass <- loadRData("data/xgbTrainResults_multiclass.R")
+
+xgbTrainResultsMulticlass_binded <- xgbTrainResultsMulticlass %>% 
+  bind_rows() %>% 
+  distinct()
+
+PrettyConfusionMatrix(xgbTrainResultsMulticlass_binded$class, 
+                      xgbTrainResultsMulticlass_binded$.pred_class)
+
+ggsave("confusionMatrix.png", width = 20, heigh = 12, dpi = 500)
+```
+
+```{r}
+#Calculate F1-score for each model iteration. 
+fmeasAllTrainMulticlass <- c()
+for (i in 1:12){
+  f1 <- f_meas(data = xgbTrainResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
+  fmeasAllTrainMulticlass <- append(fmeasAllTrainMulticlass,f1)
+  
+}
+fmeasAllTrainMulticlass
+
+mean(fmeasAllTrainMulticlass)
+sd(fmeasAllTrainMulticlass)
+
+fmeasAllTrainBinary <- c()
+for (i in 1:12){
+  f1 <- f_meas(data = xgbTrainResultsBinary[[i]], truth = class, estimate = .pred_class)$.estimate
+  fmeasAllTrainBinary <- append(fmeasAllTrainBinary,f1)
+  
+}
+fmeasAllTrainBinary
+
+mean(fmeasAllTrainBinary)
+sd(fmeasAllTrainBinary)
+```
+
+# Look into the test results
+
+```{r}
+xgbTestResultsMulticlass <- loadRData("data/xgbTestResults_multiclass.R")
+
+xgbTestResultsMulticlass_binded <- xgbTestResultsMulticlass %>% 
+  bind_rows() %>% 
+  distinct()
+
+PrettyConfusionMatrix(xgbTestResultsMulticlass_binded$class, 
+                      xgbTestResultsMulticlass_binded$.pred_class)
+
+```
+
+```{r}
+#Calculate F1-score for each model iteration. 
+fmeasAllTestMulticlass <- c()
+for (i in 1:12){
+  f1 <- f_meas(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
+  fmeasAllTestMulticlass <- append(fmeasAllTestMulticlass,f1)
+  
+}
+fmeasAllTestMulticlass
+
+mean(fmeasAllTestMulticlass)
+sd(fmeasAllTestMulticlass)
+
+fmeasAllTestBinary <- c()
+for (i in 1:12){
+  f1 <- f_meas(data = xgbTestResultsBinary[[i]], truth = class, estimate = .pred_class)$.estimate
+  fmeasAllTestBinary <- append(fmeasAllTestBinary,f1)
+  
+}
+fmeasAllTestBinary
+
+mean(fmeasAllTestBinary)
+sd(fmeasAllTestBinary)
+```
+
+```{r}
+#Calculate F1-score for each model iteration. 
+fmeasAll <- c()
+sensAll <- c()
+specAll <- c()
+for (i in 1:12){
+  f1 <- f_meas(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
+  sensi <- sensitivity(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
+  speci <- specificity(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
+  fmeasAll <- append(fmeasAll,f1)
+  sensAll <- append(sensAll,sensi)
+  specAll <- append(specAll,speci)
+  
+}
+fmeasAll
+sensAll
+specAll
+
+mean(fmeasAll)
+sd(fmeasAll)
+
+mean(sensAll)
+sd(sensAll)
+
+mean(specAll)
+sd(specAll)
+
+```
+
+# Variable importance
+
+```{r}
+#Combine variable importance lists
+variableImportanceList <- list()
+
+for (i in 1:12){
+  
+  vi <- xgbFittedMulticlass[[i]] %>% 
+    extract_fit_parsnip() %>% 
+    vip::vi() %>% 
+    mutate(
+      n = 1:n(),
+      weight = paste(Variable, n, sep="_")
+      )
+    
+  variableImportanceList[[i]] <- vi$weight
+}
+
+```
+
+```{r}
+mostFreqFeatures <- 
+  #Convert the nested list of vectors to one long vector in a tibble
+  tibble(features = unlist(variableImportanceList)) %>% 
+  count(features) %>% 
+  mutate(imp = as.numeric(sub(".*_", "", features))) %>% 
+  filter(imp <= 10 & n >= 6)
+
+mostFreqFeatures %>% view()
+```
