@@ -1,8 +1,7 @@
 ---
 title: "02-FinalXgBoostModel"
-author: "Nicki lentz"
-date: "`r Sys.Date()`"
-output: html_document
+format: html
+editor: visual
 editor_options: 
   chunk_output_type: console
 ---
@@ -21,7 +20,7 @@ library(tidymodels)
 tidymodels_prefer()
 library(doSNOW)
 library(finetune)
-source("PrettyConfusionMatrix.R")
+source("confusionMatrixFromList.R")
 #ggthemr::ggthemr("greyscale")
 
 loadRData <- function(fileName){
@@ -168,113 +167,93 @@ save(xgbTestResults, file = "data/xgbTestResults_multiclass.R")
 
 ```
 
-# Look into the training results
+# Look into the test results
 
 ```{r}
-xgbTrainResultsMulticlass <- loadRData("data/xgbTrainResults_multiclass.R")
-
-xgbTrainResultsMulticlass_binded <- xgbTrainResultsMulticlass %>% 
-  bind_rows() %>% 
-  distinct()
-
-PrettyConfusionMatrix(xgbTrainResultsMulticlass_binded$class, 
-                      xgbTrainResultsMulticlass_binded$.pred_class)
+xgbTestResultsMulticlass <- loadRData("data/xgbTestResults_multiclass.R")
+confusionMatrixFromList(xgbTestResultsMulticlass)
 
 ggsave("confusionMatrix.png", width = 20, heigh = 12, dpi = 500)
 ```
 
 ```{r}
 #Calculate F1-score for each model iteration. 
-fmeasAllTrainMulticlass <- c()
+caretConfusionMatrix <- list()
 for (i in 1:12){
-  f1 <- f_meas(data = xgbTrainResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
-  fmeasAllTrainMulticlass <- append(fmeasAllTrainMulticlass,f1)
+  data <- xgbTestResultsMulticlass[[i]] %>% 
+    janitor::clean_names()
+  
+  cm <- caret::confusionMatrix(data = data$pred_class, reference = data$class, mode = "everything")
+  caretConfusionMatrix[[i]] <- cm
   
 }
-fmeasAllTrainMulticlass
 
-mean(fmeasAllTrainMulticlass)
-sd(fmeasAllTrainMulticlass)
+caretConfusionMatrix[[12]]
 
-fmeasAllTrainBinary <- c()
-for (i in 1:12){
-  f1 <- f_meas(data = xgbTrainResultsBinary[[i]], truth = class, estimate = .pred_class)$.estimate
-  fmeasAllTrainBinary <- append(fmeasAllTrainBinary,f1)
-  
-}
-fmeasAllTrainBinary
-
-mean(fmeasAllTrainBinary)
-sd(fmeasAllTrainBinary)
 ```
 
-# Look into the test results
+```{r}
+#Multiclass AUC function for each class
+AUCmulticlass <- function(data){
+  
+  data_class <- data %>% 
+    janitor::clean_names() %>% 
+    mutate(twoClass = as_factor(ifelse(class == "Low Intensity", "Low Intensity", "Other")),
+           pred_other = pred_throw + pred_dynamic + pred_running) %>% 
+    roc_auc(twoClass, pred_low_intensity)
+  
+  print(glue::glue("OvR -- Low Intensity: {data_class}"))
+  
+  data_class <- data %>% 
+    janitor::clean_names() %>% 
+    mutate(twoClass = as_factor(ifelse(class == "Dynamic", "Dynamic", "Other")),
+           pred_other = pred_low_intensity + pred_throw + pred_running) %>% 
+    roc_auc(twoClass, pred_other)
+  
+  print(glue::glue("OvR -- Dynamic: {data_class}"))
+  
+  data_class <- data %>% 
+    janitor::clean_names() %>% 
+    mutate(twoClass = as_factor(ifelse(class == "Running", "Running", "Other")),
+           pred_other = pred_low_intensity + pred_dynamic + pred_throw) %>% 
+    roc_auc(twoClass, pred_other)
+  
+  print(glue::glue("OvR -- Running: {data_class}"))
+  
+  data_class <- data %>% 
+    janitor::clean_names() %>% 
+    mutate(twoClass = as_factor(ifelse(class == "Throw", "Throw", "Other")),
+           pred_other = pred_low_intensity + pred_dynamic + pred_running) %>% 
+    roc_auc(twoClass, pred_other)
+  
+  print(glue::glue("OvR -- Throw: {data_class}"))
+  
+  
+}
+
+AUCmulticlass(xgbTestResultsMulticlass[[12]])
+```
 
 ```{r}
-xgbTestResultsMulticlass <- loadRData("data/xgbTestResults_multiclass.R")
+xgbTestResultsMulticlass[[12]] %>% 
+  janitor::clean_names() %>% 
+  roc_curve(class, pred_low_intensity:pred_throw) %>% 
+  autoplot() + 
+  ggtitle("Subject 12")
+```
 
+```{r}
 xgbTestResultsMulticlass_binded <- xgbTestResultsMulticlass %>% 
   bind_rows() %>% 
-  distinct()
+  distinct() %>% 
+  janitor::clean_names()
 
-PrettyConfusionMatrix(xgbTestResultsMulticlass_binded$class, 
-                      xgbTestResultsMulticlass_binded$.pred_class)
-
+AUCmulticlass(xgbTestResultsMulticlass_binded)
+caret::confusionMatrix(data = xgbTestResultsMulticlass_binded$pred_class, 
+                       reference = xgbTestResultsMulticlass_binded$class, 
+                       mode = "everything")
 ```
 
-```{r}
-#Calculate F1-score for each model iteration. 
-fmeasAllTestMulticlass <- c()
-for (i in 1:12){
-  f1 <- f_meas(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
-  fmeasAllTestMulticlass <- append(fmeasAllTestMulticlass,f1)
-  
-}
-fmeasAllTestMulticlass
-
-mean(fmeasAllTestMulticlass)
-sd(fmeasAllTestMulticlass)
-
-fmeasAllTestBinary <- c()
-for (i in 1:12){
-  f1 <- f_meas(data = xgbTestResultsBinary[[i]], truth = class, estimate = .pred_class)$.estimate
-  fmeasAllTestBinary <- append(fmeasAllTestBinary,f1)
-  
-}
-fmeasAllTestBinary
-
-mean(fmeasAllTestBinary)
-sd(fmeasAllTestBinary)
-```
-
-```{r}
-#Calculate F1-score for each model iteration. 
-fmeasAll <- c()
-sensAll <- c()
-specAll <- c()
-for (i in 1:12){
-  f1 <- f_meas(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
-  sensi <- sensitivity(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
-  speci <- specificity(data = xgbTestResultsMulticlass[[i]], truth = class, estimate = .pred_class)$.estimate
-  fmeasAll <- append(fmeasAll,f1)
-  sensAll <- append(sensAll,sensi)
-  specAll <- append(specAll,speci)
-  
-}
-fmeasAll
-sensAll
-specAll
-
-mean(fmeasAll)
-sd(fmeasAll)
-
-mean(sensAll)
-sd(sensAll)
-
-mean(specAll)
-sd(specAll)
-
-```
 
 # Variable importance
 
