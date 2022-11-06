@@ -24,7 +24,7 @@ library(VSURF)
 library(caret)
 trellis.par.set(caretTheme())
 
-dfMappings <- data.table::fread("../../data/processed/dfMappingsAllTags.csv") %>% 
+dfMappings <- data.table::fread("data/dfMappingsAllTags.csv") %>% 
   filter(Tag != "RESET") %>% 
   select(-c(OccID, index, Occurence, Timelength))
 
@@ -93,7 +93,8 @@ save(selectedFeatures_rfe_model_multiclass, file = "../../data/processed/VSURF/r
 vsurf_selectedfeatures_multiclass <- list()
 VSURFlist_multiclass <- list()
 j = 1
-#Temporary only for subject 2 - binary vsurf
+
+
 for (i in unique(dfMappings_multiclass$Subject)){
   
   tictoc::tic("Total")
@@ -114,7 +115,7 @@ for (i in unique(dfMappings_multiclass$Subject)){
     select(!c("Subject", "Tag"))
   
   set.seed(456)
-  # mtry = p / 3 based on Genuer 2010
+  # mtry = p / 3 basedRFE on Genuer 2010
   dfTrain.vsurf <- VSURF(x, y, parallel = TRUE, 
                          ncores = 6, clusterType = "PSOCK", ntree = 1000)
   

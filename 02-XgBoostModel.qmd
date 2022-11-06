@@ -20,8 +20,10 @@ library(tidymodels)
 tidymodels_prefer()
 library(doSNOW)
 library(finetune)
+library(latex2exp)
+library(patchwork)
 source("confusionMatrixFromList.R")
-#ggthemr::ggthemr("greyscale")
+ggthemr::ggthemr("greyscale")
 
 loadRData <- function(fileName){
   #loads an RData file, and returns it
@@ -31,7 +33,7 @@ loadRData <- function(fileName){
 
 #Import results from the most important variables and the main df
 
-selectedFeatures <- loadRData(file = "../../data/processed/VSURF/combination_selectedfeatures_binary.Rdata")
+selectedFeatures <- loadRData(file = "../../data/processed/VSURF/combination_selectedfeatures_multiclass.Rdata")
 selectedFeatures <- 
   #Convert the nested list of vectors to one long vector in a tibble
   tibble(features = unlist(selectedFeatures)) %>% 
@@ -173,7 +175,7 @@ save(xgbTestResults, file = "data/xgbTestResults_multiclass.R")
 xgbTestResultsMulticlass <- loadRData("data/xgbTestResults_multiclass.R")
 confusionMatrixFromList(xgbTestResultsMulticlass)
 
-ggsave("confusionMatrix.png", width = 20, heigh = 12, dpi = 500)
+ggsave("confusionMatrix.png", width = 20, heigh = 12, dpi = 600)
 ```
 
 ```{r}
@@ -188,7 +190,7 @@ for (i in 1:12){
   
 }
 
-caretConfusionMatrix[[12]]
+caretConfusionMatrix[[2]]
 
 ```
 
@@ -231,7 +233,7 @@ AUCmulticlass <- function(data){
   
 }
 
-AUCmulticlass(xgbTestResultsMulticlass[[12]])
+AUCmulticlass(xgbTestResultsMulticlass[[1]])
 ```
 
 ```{r}
@@ -252,12 +254,23 @@ AUCmulticlass(xgbTestResultsMulticlass_binded)
 caret::confusionMatrix(data = xgbTestResultsMulticlass_binded$pred_class, 
                        reference = xgbTestResultsMulticlass_binded$class, 
                        mode = "everything")
-```
 
+
+f_meas(data = xgbTestResultsMulticlass_binded, truth = class, estimate = pred_class, estimator = "macro_weighted")
+
+sens(data = xgbTestResultsMulticlass_binded, truth = class, estimate = pred_class, estimator = "macro_weighted")
+
+spec(data = xgbTestResultsMulticlass_binded, truth = class, estimate = pred_class, estimator = "macro_weighted")
+
+roc_auc(data = xgbTestResultsMulticlass_binded, truth = class, pred_low_intensity:pred_throw,
+        estimator = "macro_weighted")
+```
 
 # Variable importance
 
 ```{r}
+xgbFittedMulticlass <- loadRData(file = "data/xgbFitted_multiclass.R")
+
 #Combine variable importance lists
 variableImportanceList <- list()
 
@@ -282,7 +295,81 @@ mostFreqFeatures <-
   tibble(features = unlist(variableImportanceList)) %>% 
   count(features) %>% 
   mutate(imp = as.numeric(sub(".*_", "", features))) %>% 
-  filter(imp <= 10 & n >= 6)
+  filter(imp <= 10)
 
 mostFreqFeatures %>% view()
+```
+
+```{r}
+dfMappings %>% 
+  ggplot(aes(x = magnitude_max, energyPeakUp, color = Tag)) + 
+  geom_point(alpha = 0.5, size = 3) + 
+  scale_color_manual(values = c("blue","green","orange","purple")) + 
+  labs(x = "Max value for Acceleration Magnitude",
+       y = "Peak power for Up Acceleration",
+       color = "Event") + 
+  theme(legend.position = "top",
+        text = element_text(size = 35),
+        legend.title = element_text(size = 35, face = "bold"),
+        legend.key.size = unit(3, 'cm'),
+        axis.title = element_text(size = 40, face = "bold"),
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 10)))
+
+ggsave("magMaxvsPeakUp.png", width = 20, heigh = 12, dpi = 300)
+```
+
+```{r}
+plotReady <- dfMappings %>% 
+  select(Tag, contains("Peak")) %>% 
+  rename(
+    Forward = "energyPeakForward",
+    Upward = "energyPeakUp",
+    Side = "energyPeakSide",
+    Roll = "energyPeakRoll",
+    Pitch = "energyPeakPitch",
+    Yaw = "energyPeakYaw",
+    "Acceleration Magnitude" = "energyPeakMagnitude",
+    "Rotation Magnitude" = "energyrotPeakMagnitude"
+  )
+
+p1 <- plotReady %>% 
+  pivot_longer(cols = c("Forward", "Upward", "Side", "Acceleration Magnitude")) %>% 
+  mutate(name = factor(name, levels=c("Forward",
+                                      "Side",
+                                      "Upward",
+                                      "Acceleration Magnitude"))) %>% 
+  ggplot(aes(x = Tag, y = value, color = Tag)) + 
+  ggbeeswarm::geom_quasirandom(alpha=0.5) +
+  facet_wrap(~name, scale = "free", ncol = 1) + 
+  scale_color_manual(values = c("blue","green","orange","purple")) + 
+  labs(x = "",
+       y = TeX("Acceleration [$m\\cdot s^{-2}$]")) + 
+  theme(legend.position = "none",
+        text = element_text(size = 25),
+        axis.title = element_text(size = 30, face = "bold"),
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 10)))
+
+p2 <- plotReady %>% 
+  pivot_longer(cols = c("Roll", "Pitch", "Yaw", "Rotation Magnitude")) %>% 
+  mutate(name = factor(name, levels=c("Roll",
+                                      "Pitch",
+                                      "Yaw",
+                                      "Rotation Magnitude"))) %>% 
+  ggplot(aes(x = Tag, y = value, color = Tag)) + 
+  ggbeeswarm::geom_quasirandom(alpha=0.5) +
+  facet_wrap(~name, scale = "free", ncol = 1) + 
+  scale_color_manual(values = c("blue","green","orange","purple")) + 
+  labs(x = "",
+       y = TeX("Angular rotation [degree$\\cdot s^{-1}$]")) + 
+  theme(legend.position = "none",
+        text = element_text(size = 25),
+        axis.title = element_text(size = 30, face = "bold"),
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 10)))
+
+finalPlot <- p1 + p2 +plot_annotation(tag_levels ="A")
+ggsave("PeakPowerSwarmplot.png", plot = finalPlot, width = 20, heigh = 12, dpi = 300)
+
 ```
