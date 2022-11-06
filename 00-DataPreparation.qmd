@@ -1,7 +1,7 @@
 ---
 title: "00-DataPreparation"
 author: "Nicki Lentz"
-date: "`r Sys.Date()`"
+date: "27/10/2021"
 output: html_document
 editor_options: 
   chunk_output_type: console
@@ -18,7 +18,9 @@ knitr::opts_chunk$set(
 
 library(tidyverse)
 library(sqldf)
-source("scripts/import_all.R")
+library(fabletools)
+library(feasts)
+source("import_all.R")
 ```
 
 ## 01-Clean
@@ -82,10 +84,19 @@ for (i in 1:length(data$IMU)){
                                as.numeric(Occurence), ceiling(1:n()/50)),
            #Create unique ID for each occurence
            OccID = paste(TagOcc, OccGrouped, sep = "_")) %>% 
-    ungroup()
-  
-  
-  
+    ungroup() 
+
+  #Removing data after 100 rows for each throw occurence,
+  #as each throw is set to be 1 second of data.
+  ThrowOneSec <- IMU_labeled %>% 
+  group_by(TagOcc) %>% 
+  mutate(n = 1:n()) %>% 
+  ungroup()
+
+  ThrowOneSec <- ThrowOneSec[!(ThrowOneSec$Tag == "Throw" & ThrowOneSec$n > 100),] 
+
+  IMU_labeled <- ThrowOneSec %>% 
+    select(-n)
   
   dfList[[i]] <- IMU_labeled
 }
@@ -103,25 +114,42 @@ save(dfList, file = "data/dfListAllTags.Rdata")
 ```
 
 
+
+
 ## 02-Featureengineering vectors
 
 Purpose was to create new feature vectors which later would be aggregated into windows.
 
 ```{r}
+# energySignal <- function(vector){
+#   
+#   var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
+#   var.spy <- 2*var.spec$spec
+#   
+#   energy <- sum(sqrt(var.spy^2)) / length(vector)
+#   return(energy)
+# }
+
+# peakEnergySignal <- function(vector){
+#   var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
+#   var.spy <- 2*var.spec$spec
+#   
+#   normalizedPeak <- max(var.spy / length(vector))
+#   return(normalizedPeak)
+# }
+
+#Because of Parseval's theorem I do not need to convert to frequency domain prior to 
+#finding the energi signal
+
 energySignal <- function(vector){
   
-  var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
-  var.spy <- 2*var.spec$spec
-  
-  energy <- sum(sqrt(var.spy^2)) / length(var.spy)
+  energy <- sum(sqrt(vector^2)) / length(vector)
   return(energy)
 }
 
 peakEnergySignal <- function(vector){
-  var.spec <- spectrum(vector, log = "no", span = 10, plot = FALSE)
-  var.spy <- 2*var.spec$spec
   
-  normalizedPeak <- max(var.spy / length(vector))
+  normalizedPeak <- max(sqrt(vector^2)) / length(vector)
   return(normalizedPeak)
 }
 ```
@@ -263,7 +291,7 @@ save(dfList, file = "data/dfListFeaturesAllTags.Rdata")
 Aggregatting across the windows to calculate means, IQR, max, etc.
 
 ```{r}
-load("data/processed/dfListFeaturesAllTags.Rdata")
+load("data/dfListFeaturesAllTags.Rdata")
 
 
 dfListMappings = list()
@@ -284,14 +312,10 @@ for (i in 1:length(dfList)){
       acf10mag = acf10mag,
       diff1_acf1mag = diff1_acf1mag,
       diff1_acf10mag = diff1_acf10mag,
-      diff2_acf1mag = diff2_acf1mag,
-      diff2_acf10mag = diff2_acf10mag,
       acf1rot = acf1rot,
       acf10rot = acf10rot,
       diff1_acf1rot = diff1_acf1rot,
       diff1_acf10rot = diff1_acf10rot,
-      diff2_acf1rot = diff2_acf1rot,
-      diff2_acf10rot = diff2_acf10rot,
       energyForward = energyForward,
       energyUp = energyUp,
       energySide = energySide,
